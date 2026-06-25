@@ -1,0 +1,25 @@
+# dependencias
+node_modules/
+
+# next.js
+.next/
+out/
+
+# datos runtime (NO versionar)
+data/
+auth/
+
+# variables de entorno
+.env.local
+.env
+
+# sistema operativo
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+npm-debug.log*
+
+# typescript build
+*.tsbuildinfo
