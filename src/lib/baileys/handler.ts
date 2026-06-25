@@ -7,31 +7,34 @@ import {
   getRecentHistory,
   setNaalooEmployee,
   setPendingAction,
+  setMode,
 } from "../db";
 import { generateReply, interpretarPedidoInsumos } from "../openrouter";
-import { getEmpleadoPorNombre, getEmpleadoPorId } from "../naaloo";
+import { getEmpleadoPorDni, getEmpleadoPorId, getAusencias, getFichajes } from "../naaloo";
 import { guardarPedido } from "../pedidos";
+import { esLlegadaTarde } from "../horarios";
 
 type Sock = ReturnType<typeof makeWASocket>;
 type UpsertEvent = BaileysEventMap["messages.upsert"];
 
 const MSG_BIENVENIDA =
-  "Hola, soy el asistente de RRHH de Suelos del Norte. Para comenzar necesito tu nombre completo. Enviamelo y te identifico enseguida.";
+  "Hola, soy el asistente de RRHH de Suelos del Norte. Para comenzar necesito tu numero de DNI (sin puntos). Enviamelo y te identifico enseguida.";
 
-const MSG_NOMBRE_NO_ENCONTRADO =
-  "No encontre ningun empleado con ese nombre. Fijate de escribirlo igual que figura en el sistema (nombre y apellido completos).";
+const MSG_DNI_NO_ENCONTRADO =
+  "No encontre ningun empleado con ese DNI. Fijate de escribirlo bien, sin puntos ni espacios.";
 
-const MSG_NOMBRE_ERROR =
+const MSG_DNI_ERROR =
   "Tuve un problema al buscarte. Intenta de nuevo en unos minutos.";
 
 const MENU =
   "En que te puedo ayudar? Podes consultarme sobre:\n\n" +
-  "- Mis ausencias y licencias\n" +
-  "- Mis fichajes y asistencia\n" +
-  "- Mis datos laborales (cargo, area, email, fecha de ingreso)\n" +
+  "- Por que no me pagaron el presentismo\n" +
+  "- Mis faltas y permisos\n" +
+  "- Mis horarios (cuando entre y cuando sali)\n" +
+  "- Mis datos (numero de empleado, area, email, etc)\n" +
   "- Mis vacaciones\n" +
-  "- Pedido de insumos\n" +
-  "- Contactar a la secretaria\n\n" +
+  "- Pedido de materiales o herramientas\n" +
+  "- Hablar con la secretaria\n\n" +
   "Escribime lo que necesitas.";
 
 const MSG_IDENTIFICADO = (nombre: string) =>
@@ -102,6 +105,35 @@ async function processMessage(
     personalId: fresh.naaloo_personal_id,
   };
 
+  // ─── Flujo de presentismo ──────────────────────────────────────────────────
+  if (fresh.pending_action === "presentismo_mes") {
+    const mes = parseMesElegido(text);
+    if (!mes) {
+      const reply = "No te entendi. Decime: el mes actual o el mes anterior?";
+      insertMessage(convo.id, "assistant", reply);
+      await sock.sendMessage(remoteJid, { text: reply });
+      console.log(`[bot] → ${phone}: "${reply.slice(0, 60)}"`);
+      return;
+    }
+    setPendingAction(convo.id, null);
+    const reply = await procesarPresentismo(mes, empleado.personalId);
+    insertMessage(convo.id, "assistant", reply);
+    await sock.sendMessage(remoteJid, { text: reply });
+    console.log(`[bot] → ${phone}: "${reply.slice(0, 60)}"`);
+    return;
+  }
+
+  // Detecta si el empleado pregunta por el presentismo
+  const quierePresentismo = /presentismo|premio.*asisten|plus.*asisten/i.test(text);
+  if (quierePresentismo) {
+    setPendingAction(convo.id, "presentismo_mes");
+    const reply = "Te puedo decir si tenes faltas en el mes. Queres ver el mes actual o el mes anterior?";
+    insertMessage(convo.id, "assistant", reply);
+    await sock.sendMessage(remoteJid, { text: reply });
+    console.log(`[bot] → ${phone}: presentismo iniciado`);
+    return;
+  }
+
   // ─── Flujo de pedido de insumos ───────────────────────────────────────────
   if (fresh.pending_action === "pedido_insumos") {
     const reply = await procesarPedidoInsumos(convo.id, text, empleado);
@@ -127,7 +159,7 @@ async function processMessage(
   console.log(`[bot] LLM (${history.length} mensajes, empleado=${empleado.nombreCompleto})`);
 
   const start = Date.now();
-  const reply = await generateReply(history, empleado);
+  const { reply, derivedToHuman } = await generateReply(history, empleado);
   console.log(`[bot] LLM respondió en ${Date.now() - start}ms`);
 
   if (!reply) return;
@@ -135,6 +167,11 @@ async function processMessage(
   insertMessage(convo.id, "assistant", reply);
   await sock.sendMessage(remoteJid, { text: reply });
   console.log(`[bot] → ${phone}: "${reply.slice(0, 60)}"`);
+
+  if (derivedToHuman) {
+    setMode(convo.id, "HUMAN");
+    console.log(`[bot] Conversación ${convo.id} derivada a HUMAN (secretaria)`);
+  }
 }
 
 async function procesarPedidoInsumos(
@@ -180,24 +217,117 @@ async function procesarPedidoInsumos(
   }
 }
 
+function parseMesElegido(text: string): "actual" | "anterior" | null {
+  const t = text.toLowerCase();
+  if (/anterior|pasado/.test(t)) return "anterior";
+  if (/actual|corriente|este mes/.test(t)) return "actual";
+  return null;
+}
+
+const NOMBRES_MES = [
+  "enero", "febrero", "marzo", "abril", "mayo", "junio",
+  "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+];
+
+function rangoMes(mes: "actual" | "anterior"): {
+  desde: string;
+  hasta: string;
+  etiqueta: string;
+} {
+  const hoy = new Date();
+  let anio = hoy.getFullYear();
+  let mesIndex = hoy.getMonth();
+
+  if (mes === "anterior") {
+    mesIndex -= 1;
+    if (mesIndex < 0) {
+      mesIndex = 11;
+      anio -= 1;
+    }
+  }
+
+  const desde = new Date(anio, mesIndex, 1);
+  const hasta = mes === "actual" ? hoy : new Date(anio, mesIndex + 1, 0);
+  const fmt = (d: Date) => d.toISOString().slice(0, 10);
+
+  return { desde: fmt(desde), hasta: fmt(hasta), etiqueta: NOMBRES_MES[mesIndex] };
+}
+
+async function procesarPresentismo(
+  mes: "actual" | "anterior",
+  personalId: number
+): Promise<string> {
+  const { desde, hasta, etiqueta } = rangoMes(mes);
+
+  try {
+    const [ausencias, fichajes, empleado] = await Promise.all([
+      getAusencias({ fechaDesde: desde, fechaHasta: hasta, pageSize: 100 }),
+      getFichajes({ fechaDesde: desde, fechaHasta: hasta, pageSize: 100 }),
+      getEmpleadoPorId(personalId).catch(() => null),
+    ]);
+
+    const faltas = ausencias.filter(
+      (a) => a.personalLegajo?.personalId === personalId && !a.isVacation
+    );
+
+    const lineas: string[] = [`Te paso lo de ${etiqueta}:`];
+
+    if (faltas.length === 0) {
+      lineas.push("- No tenes faltas registradas.");
+    } else {
+      lineas.push(`- Tenes ${faltas.length} falta(s):`);
+      for (const f of faltas) {
+        const tipo = f.ausencia?.nombre ?? "Falta";
+        lineas.push(`  • ${tipo}: ${f.fechaDesde} a ${f.fechaHasta}`);
+      }
+    }
+
+    const oficina = empleado?.oficinaNombre ?? "";
+    if (!oficina) {
+      lineas.push("- Llegadas tarde: no tengo cargada tu oficina, no puedo calcularlo. Hablalo con la secretaria.");
+    } else {
+      const propios = fichajes.filter((f) => f.personalLegajo?.personalId === personalId);
+      const tarde = propios.filter((f) => f.fechaIngreso && esLlegadaTarde(oficina, f.fechaIngreso));
+
+      if (tarde.length === 0) {
+        lineas.push("- No llegaste tarde ningun dia.");
+      } else {
+        lineas.push(`- Llegaste tarde ${tarde.length} dia(s):`);
+        for (const f of tarde) {
+          lineas.push(`  • ${f.fechaIngreso.slice(0, 10)}: entraste a las ${f.fechaIngreso.slice(11, 16)}`);
+        }
+      }
+    }
+
+    lineas.push("");
+    lineas.push("Si tenes dudas sobre el presentismo, hablalo con la secretaria.");
+
+    return lineas.join("\n");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[presentismo] Error consultando faltas:", msg);
+    return "No pude consultar tus faltas en este momento. Intenta de nuevo en unos minutos.";
+  }
+}
+
 async function identificarEmpleado(
   sock: Sock,
   remoteJid: string,
   conversationId: number,
   text: string
 ): Promise<string> {
-  const trimmed = text.trim();
+  const soloDigitos = text.replace(/\D/g, "");
 
-  // Si el mensaje es muy corto (una sola palabra o menos de 4 chars) pedimos el nombre
-  const pareceNombre = trimmed.length >= 4 && trimmed.includes(" ");
-  if (!pareceNombre) {
+  // DNI argentino: 7 u 8 dígitos
+  const pareceDni = soloDigitos.length >= 7 && soloDigitos.length <= 8;
+  if (!pareceDni) {
     return MSG_BIENVENIDA;
   }
 
   try {
-    const empleado = await getEmpleadoPorNombre(trimmed);
+    const empleado = await getEmpleadoPorDni(soloDigitos);
     if (!empleado?.personalId) {
-      return MSG_NOMBRE_NO_ENCONTRADO;
+      return MSG_DNI_NO_ENCONTRADO;
     }
 
     setNaalooEmployee(conversationId, empleado.personalId, empleado.legajo);
@@ -212,6 +342,6 @@ async function identificarEmpleado(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("[bot] Error buscando empleado:", msg);
-    return MSG_NOMBRE_ERROR;
+    return MSG_DNI_ERROR;
   }
 }

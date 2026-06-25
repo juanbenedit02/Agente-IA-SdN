@@ -86,7 +86,33 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "derivar_a_secretaria",
+      description: "Deriva la conversación a la secretaria (atención humana). Usar SIEMPRE que el empleado pida hablar con una persona, pregunte algo fuera de tu alcance, o necesite algo que no podés resolver con las herramientas disponibles. Después de esta llamada el bot deja de responder automáticamente en esta conversación. Devuelve el próximo día de atención para que lo comuniques.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+    },
+  },
 ];
+
+// ─── Próximo día de atención de la secretaria (martes o viernes) ─────────────
+
+function proximoDiaSecretaria(desde: Date = new Date()): string {
+  const diasHasta = (objetivo: number) => (objetivo - desde.getDay() + 7) % 7;
+  const hastaMartes = diasHasta(2);
+  const hastaViernes = diasHasta(5);
+  const esMartes = hastaMartes <= hastaViernes;
+  const fecha = new Date(desde);
+  fecha.setDate(fecha.getDate() + (esMartes ? hastaMartes : hastaViernes));
+  const dd = String(fecha.getDate()).padStart(2, "0");
+  const mm = String(fecha.getMonth() + 1).padStart(2, "0");
+  return `${esMartes ? "martes" : "viernes"} ${dd}/${mm}`;
+}
 
 // ─── Cálculo de vacaciones (LCT Argentina, art. 150) ──────────────────────────
 
@@ -182,6 +208,10 @@ async function executeTool(
       );
     }
 
+    if (name === "derivar_a_secretaria") {
+      return `La secretaria atiende los martes y viernes por la tarde. El próximo día de atención es el ${proximoDiaSecretaria()}.`;
+    }
+
     if (name === "consultar_datos_empleado") {
       const emp = await getEmpleadoPorId(personalId);
       return [
@@ -242,7 +272,7 @@ export async function interpretarPedidoInsumos(
 export async function generateReply(
   history: Message[],
   empleado?: { nombreCompleto: string; legajo: string; personalId: number } | null
-): Promise<string> {
+): Promise<{ reply: string; derivedToHuman: boolean }> {
   const model = process.env.OPENROUTER_MODEL ?? "openai/gpt-4o-mini";
   const client = getClient();
 
@@ -268,6 +298,7 @@ export async function generateReply(
 
   // Bucle de tool calling (máximo 3 rondas para evitar loops)
   let rounds = 0;
+  let derivedToHuman = false;
   while (choice.finish_reason === "tool_calls" && choice.message.tool_calls && rounds < 3) {
     rounds++;
     const assistantMsg = choice.message;
@@ -275,6 +306,7 @@ export async function generateReply(
 
     for (const toolCall of assistantMsg.tool_calls!) {
       const args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, string>;
+      if (toolCall.function.name === "derivar_a_secretaria") derivedToHuman = true;
       const result = await executeTool(toolCall.function.name, args, empleado!.personalId);
       console.log(`[llm] Tool ${toolCall.function.name} → ${result.slice(0, 80)}`);
       toolMessages.push({
@@ -295,5 +327,5 @@ export async function generateReply(
     choice = response.choices[0];
   }
 
-  return choice.message?.content?.trim() ?? "";
+  return { reply: choice.message?.content?.trim() ?? "", derivedToHuman };
 }

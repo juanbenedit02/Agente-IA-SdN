@@ -155,28 +155,14 @@ export async function getListaLegajos(): Promise<EmpleadoLegajo[]> {
   return data.data ?? (data as unknown as EmpleadoLegajo[]);
 }
 
-function normalizar(texto: string): string {
-  return texto
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
-    .trim();
-}
-
-export async function getEmpleadoPorNombre(
-  nombreBuscado: string
+export async function getEmpleadoPorDni(
+  dniBuscado: string
 ): Promise<EmpleadoLegajo | null> {
+  const limpio = dniBuscado.replace(/\D/g, "");
+  if (!limpio) return null;
+
   const lista = await getListaLegajos();
-  const palabrasBuscadas = normalizar(nombreBuscado).split(/\s+/).filter(Boolean);
-
-  const coincidencias = lista.filter((e) => {
-    const nombreNorm = normalizar(e.nombreCompleto);
-    return palabrasBuscadas.every((p) => nombreNorm.includes(p));
-  });
-
-  // Solo identificamos si hay exactamente una coincidencia para evitar ambigüedad
-  if (coincidencias.length === 1) return coincidencias[0];
-  return null;
+  return lista.find((e) => e.dni?.replace(/\D/g, "") === limpio) ?? null;
 }
 
 export async function getListaEmpleados(pageSize = 200): Promise<EmpleadoBasico[]> {
